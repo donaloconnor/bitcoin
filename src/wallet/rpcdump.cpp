@@ -1,23 +1,23 @@
-// Copyright (c) 2009-2016 The Bitcoin Core developers
+// Copyright (c) 2009-2017 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "base58.h"
-#include "chain.h"
-#include "rpc/safemode.h"
-#include "rpc/server.h"
-#include "init.h"
-#include "validation.h"
-#include "script/script.h"
-#include "script/standard.h"
-#include "sync.h"
-#include "util.h"
-#include "utiltime.h"
-#include "wallet.h"
-#include "merkleblock.h"
-#include "core_io.h"
+#include <base58.h>
+#include <chain.h>
+#include <rpc/safemode.h>
+#include <rpc/server.h>
+#include <wallet/init.h>
+#include <validation.h>
+#include <script/script.h>
+#include <script/standard.h>
+#include <sync.h>
+#include <util.h>
+#include <utiltime.h>
+#include <wallet/wallet.h>
+#include <merkleblock.h>
+#include <core_io.h>
 
-#include "rpcwallet.h"
+#include <wallet/rpcwallet.h>
 
 #include <fstream>
 #include <stdint.h>
@@ -81,7 +81,7 @@ UniValue importprivkey(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)
         throw std::runtime_error(
             "importprivkey \"privkey\" ( \"label\" ) ( rescan )\n"
-            "\nAdds a private key (as returned by dumpprivkey) to your wallet.\n"
+            "\nAdds a private key (as returned by dumpprivkey) to your wallet. Requires a new wallet backup.\n"
             "\nArguments:\n"
             "1. \"privkey\"          (string, required) The private key (see dumpprivkey)\n"
             "2. \"label\"            (string, optional, default=\"\") An optional label\n"
@@ -165,7 +165,7 @@ UniValue abortrescan(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() > 0)
         throw std::runtime_error(
             "abortrescan\n"
-            "\nStops current wallet rescan triggered e.g. by an importprivkey call.\n"
+            "\nStops current wallet rescan triggered by an RPC call, e.g. by an importprivkey call.\n"
             "\nExamples:\n"
             "\nImport a private key\n"
             + HelpExampleCli("importprivkey", "\"mykey\"") +
@@ -226,7 +226,7 @@ UniValue importaddress(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)
         throw std::runtime_error(
             "importaddress \"address\" ( \"label\" rescan p2sh )\n"
-            "\nAdds a script (in hex) or address that can be watched as if it were in your wallet but cannot be used to spend.\n"
+            "\nAdds a script (in hex) or address that can be watched as if it were in your wallet but cannot be used to spend. Requires a new wallet backup.\n"
             "\nArguments:\n"
             "1. \"script\"           (string, required) The hex-encoded script (or address)\n"
             "2. \"label\"            (string, optional, default=\"\") An optional label\n"
@@ -340,7 +340,7 @@ UniValue importprunedfunds(const JSONRPCRequest& request)
 
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    if (pwallet->IsMine(wtx)) {
+    if (pwallet->IsMine(*wtx.tx)) {
         pwallet->AddToWallet(wtx, false);
         return NullUniValue;
     }
@@ -396,7 +396,7 @@ UniValue importpubkey(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)
         throw std::runtime_error(
             "importpubkey \"pubkey\" ( \"label\" rescan )\n"
-            "\nAdds a public key (in hex) that can be watched as if it were in your wallet but cannot be used to spend.\n"
+            "\nAdds a public key (in hex) that can be watched as if it were in your wallet but cannot be used to spend. Requires a new wallet backup.\n"
             "\nArguments:\n"
             "1. \"pubkey\"           (string, required) The hex-encoded public key\n"
             "2. \"label\"            (string, optional, default=\"\") An optional label\n"
@@ -456,7 +456,7 @@ UniValue importwallet(const JSONRPCRequest& request)
     if (request.fHelp || request.params.size() != 1)
         throw std::runtime_error(
             "importwallet \"filename\"\n"
-            "\nImports keys from a wallet dump file (see dumpwallet).\n"
+            "\nImports keys from a wallet dump file (see dumpwallet). Requires a new wallet backup to include imported keys.\n"
             "\nArguments:\n"
             "1. \"filename\"    (string, required) The wallet file\n"
             "\nExamples:\n"
@@ -500,40 +500,57 @@ UniValue importwallet(const JSONRPCRequest& request)
         if (vstr.size() < 2)
             continue;
         CBitcoinSecret vchSecret;
-        if (!vchSecret.SetString(vstr[0]))
-            continue;
-        CKey key = vchSecret.GetKey();
-        CPubKey pubkey = key.GetPubKey();
-        assert(key.VerifyPubKey(pubkey));
-        CKeyID keyid = pubkey.GetID();
-        if (pwallet->HaveKey(keyid)) {
-            LogPrintf("Skipping import of %s (key already present)\n", EncodeDestination(keyid));
-            continue;
-        }
-        int64_t nTime = DecodeDumpTime(vstr[1]);
-        std::string strLabel;
-        bool fLabel = true;
-        for (unsigned int nStr = 2; nStr < vstr.size(); nStr++) {
-            if (boost::algorithm::starts_with(vstr[nStr], "#"))
-                break;
-            if (vstr[nStr] == "change=1")
-                fLabel = false;
-            if (vstr[nStr] == "reserve=1")
-                fLabel = false;
-            if (boost::algorithm::starts_with(vstr[nStr], "label=")) {
-                strLabel = DecodeDumpString(vstr[nStr].substr(6));
-                fLabel = true;
+        if (vchSecret.SetString(vstr[0])) {
+            CKey key = vchSecret.GetKey();
+            CPubKey pubkey = key.GetPubKey();
+            assert(key.VerifyPubKey(pubkey));
+            CKeyID keyid = pubkey.GetID();
+            if (pwallet->HaveKey(keyid)) {
+                LogPrintf("Skipping import of %s (key already present)\n", EncodeDestination(keyid));
+                continue;
             }
+            int64_t nTime = DecodeDumpTime(vstr[1]);
+            std::string strLabel;
+            bool fLabel = true;
+            for (unsigned int nStr = 2; nStr < vstr.size(); nStr++) {
+                if (boost::algorithm::starts_with(vstr[nStr], "#"))
+                    break;
+                if (vstr[nStr] == "change=1")
+                    fLabel = false;
+                if (vstr[nStr] == "reserve=1")
+                    fLabel = false;
+                if (boost::algorithm::starts_with(vstr[nStr], "label=")) {
+                    strLabel = DecodeDumpString(vstr[nStr].substr(6));
+                    fLabel = true;
+                }
+            }
+            LogPrintf("Importing %s...\n", EncodeDestination(keyid));
+            if (!pwallet->AddKeyPubKey(key, pubkey)) {
+                fGood = false;
+                continue;
+            }
+            pwallet->mapKeyMetadata[keyid].nCreateTime = nTime;
+            if (fLabel)
+                pwallet->SetAddressBook(keyid, strLabel, "receive");
+            nTimeBegin = std::min(nTimeBegin, nTime);
+        } else if(IsHex(vstr[0])) {
+           std::vector<unsigned char> vData(ParseHex(vstr[0]));
+           CScript script = CScript(vData.begin(), vData.end());
+           if (pwallet->HaveCScript(script)) {
+               LogPrintf("Skipping import of %s (script already present)\n", vstr[0]);
+               continue;
+           }
+           if(!pwallet->AddCScript(script)) {
+               LogPrintf("Error importing script %s\n", vstr[0]);
+               fGood = false;
+               continue;
+           }
+           int64_t birth_time = DecodeDumpTime(vstr[1]);
+           if (birth_time > 0) {
+               pwallet->m_script_metadata[CScriptID(script)].nCreateTime = birth_time;
+               nTimeBegin = std::min(nTimeBegin, birth_time);
+           }
         }
-        LogPrintf("Importing %s...\n", EncodeDestination(keyid));
-        if (!pwallet->AddKeyPubKey(key, pubkey)) {
-            fGood = false;
-            continue;
-        }
-        pwallet->mapKeyMetadata[keyid].nCreateTime = nTime;
-        if (fLabel)
-            pwallet->SetAddressBook(keyid, strLabel, "receive");
-        nTimeBegin = std::min(nTimeBegin, nTime);
     }
     file.close();
     pwallet->ShowProgress("", 100); // hide progress dialog in GUI
@@ -542,7 +559,7 @@ UniValue importwallet(const JSONRPCRequest& request)
     pwallet->MarkDirty();
 
     if (!fGood)
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error adding some keys to wallet");
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error adding some keys/scripts to wallet");
 
     return NullUniValue;
 }
@@ -601,6 +618,9 @@ UniValue dumpwallet(const JSONRPCRequest& request)
         throw std::runtime_error(
             "dumpwallet \"filename\"\n"
             "\nDumps all wallet keys in a human-readable format to a server-side file. This does not allow overwriting existing files.\n"
+            "Imported scripts are included in the dumpfile, but corresponding BIP173 addresses, etc. may not be added automatically by importwallet.\n"
+            "Note that if your wallet contains keys which are not derived from your HD seed (e.g. imported keys), these are not covered by\n"
+            "only backing up the seed itself, and must be backed up too (e.g. ensure you back up the whole dumpfile).\n"
             "\nArguments:\n"
             "1. \"filename\"    (string, required) The filename with path (either absolute or relative to bitcoind)\n"
             "\nResult:\n"
@@ -636,6 +656,9 @@ UniValue dumpwallet(const JSONRPCRequest& request)
     std::map<CTxDestination, int64_t> mapKeyBirth;
     const std::map<CKeyID, int64_t>& mapKeyPool = pwallet->GetAllReserveKeys();
     pwallet->GetKeyBirthTimes(mapKeyBirth);
+
+    std::set<CScriptID> scripts = pwallet->GetCScripts();
+    // TODO: include scripts in GetKeyBirthTimes() output instead of separate
 
     // sort time/key pairs
     std::vector<std::pair<int64_t, CKeyID> > vKeyBirth;
@@ -691,6 +714,21 @@ UniValue dumpwallet(const JSONRPCRequest& request)
         }
     }
     file << "\n";
+    for (const CScriptID &scriptid : scripts) {
+        CScript script;
+        std::string create_time = "0";
+        std::string address = EncodeDestination(scriptid);
+        // get birth times for scripts with metadata
+        auto it = pwallet->m_script_metadata.find(scriptid);
+        if (it != pwallet->m_script_metadata.end()) {
+            create_time = EncodeDumpTime(it->second.nCreateTime);
+        }
+        if(pwallet->GetCScript(scriptid, script)) {
+            file << strprintf("%s %s script=1", HexStr(script.begin(), script.end()), create_time);
+            file << strprintf(" # addr=%s\n", address);
+        }
+    }
+    file << "\n";
     file << "# End of dump\n";
     file.close();
 
@@ -718,8 +756,8 @@ UniValue ProcessImport(CWallet * const pwallet, const UniValue& data, const int6
         const std::string& strRedeemScript = data.exists("redeemscript") ? data["redeemscript"].get_str() : "";
         const UniValue& pubKeys = data.exists("pubkeys") ? data["pubkeys"].get_array() : UniValue();
         const UniValue& keys = data.exists("keys") ? data["keys"].get_array() : UniValue();
-        const bool& internal = data.exists("internal") ? data["internal"].get_bool() : false;
-        const bool& watchOnly = data.exists("watchonly") ? data["watchonly"].get_bool() : false;
+        const bool internal = data.exists("internal") ? data["internal"].get_bool() : false;
+        const bool watchOnly = data.exists("watchonly") ? data["watchonly"].get_bool() : false;
         const std::string& label = data.exists("label") && !internal ? data["label"].get_str() : "";
 
         bool isScript = scriptPubKey.getType() == UniValue::VSTR;
@@ -961,7 +999,7 @@ UniValue ProcessImport(CWallet * const pwallet, const UniValue& data, const int6
                 pwallet->SetAddressBook(vchAddress, label, "receive");
 
                 if (pwallet->HaveKey(vchAddress)) {
-                    return false;
+                    throw JSONRPCError(RPC_WALLET_ERROR, "The wallet already contains the private key for this address or script");
                 }
 
                 pwallet->mapKeyMetadata[vchAddress].nCreateTime = timestamp;
@@ -1039,7 +1077,7 @@ UniValue importmulti(const JSONRPCRequest& mainRequest)
     if (mainRequest.fHelp || mainRequest.params.size() < 1 || mainRequest.params.size() > 2)
         throw std::runtime_error(
             "importmulti \"requests\" ( \"options\" )\n\n"
-            "Import addresses/scripts (with private or public keys, redeem script (P2SH)), rescanning all addresses in one-shot-only (rescan can be disabled via options).\n\n"
+            "Import addresses/scripts (with private or public keys, redeem script (P2SH)), rescanning all addresses in one-shot-only (rescan can be disabled via options). Requires a new wallet backup.\n\n"
             "Arguments:\n"
             "1. requests     (array, required) Data to be imported\n"
             "  [     (array of json objects)\n"
