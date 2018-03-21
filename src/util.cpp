@@ -72,11 +72,13 @@
 
 #include <boost/algorithm/string/case_conv.hpp> // for to_lower()
 #include <boost/algorithm/string/predicate.hpp> // for startswith() and endswith()
+#include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/program_options/detail/config_file.hpp>
 #include <boost/thread.hpp>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <openssl/conf.h>
+#include <thread>
 
 // Application startup time (used for uptime calculation)
 const int64_t nStartupTime = GetTime();
@@ -187,11 +189,7 @@ static void DebugPrintInit()
 fs::path GetDebugLogPath()
 {
     fs::path logfile(gArgs.GetArg("-debuglogfile", DEFAULT_DEBUGLOGFILE));
-    if (logfile.is_absolute()) {
-        return logfile;
-    } else {
-        return GetDataDir() / logfile;
-    }
+    return AbsPathForConfigVal(logfile);
 }
 
 bool OpenDebugLog()
@@ -316,12 +314,14 @@ static std::string LogTimestampStr(const std::string &str, std::atomic_bool *fSt
 
     if (*fStartedNewLine) {
         int64_t nTimeMicros = GetTimeMicros();
-        strStamped = DateTimeStrFormat("%Y-%m-%d %H:%M:%S", nTimeMicros/1000000);
-        if (fLogTimeMicros)
-            strStamped += strprintf(".%06d", nTimeMicros%1000000);
+        strStamped = FormatISO8601DateTime(nTimeMicros/1000000);
+        if (fLogTimeMicros) {
+            strStamped.pop_back();
+            strStamped += strprintf(".%06dZ", nTimeMicros%1000000);
+        }
         int64_t mocktime = GetMockTime();
         if (mocktime) {
-            strStamped += " (mocktime: " + DateTimeStrFormat("%Y-%m-%d %H:%M:%S", mocktime) + ")";
+            strStamped += " (mocktime: " + FormatISO8601DateTime(mocktime) + ")";
         }
         strStamped += ' ' + str;
     } else
@@ -373,6 +373,50 @@ int LogPrintStr(const std::string &str)
         }
     }
     return ret;
+}
+
+/** A map that contains all the currently held directory locks. After
+ * successful locking, these will be held here until the global destructor
+ * cleans them up and thus automatically unlocks them, or ReleaseDirectoryLocks
+ * is called.
+ */
+static std::map<std::string, std::unique_ptr<boost::interprocess::file_lock>> dir_locks;
+/** Mutex to protect dir_locks. */
+static std::mutex cs_dir_locks;
+
+bool LockDirectory(const fs::path& directory, const std::string lockfile_name, bool probe_only)
+{
+    std::lock_guard<std::mutex> ulock(cs_dir_locks);
+    fs::path pathLockFile = directory / lockfile_name;
+
+    // If a lock for this directory already exists in the map, don't try to re-lock it
+    if (dir_locks.count(pathLockFile.string())) {
+        return true;
+    }
+
+    // Create empty lock file if it doesn't exist.
+    FILE* file = fsbridge::fopen(pathLockFile, "a");
+    if (file) fclose(file);
+
+    try {
+        auto lock = MakeUnique<boost::interprocess::file_lock>(pathLockFile.string().c_str());
+        if (!lock->try_lock()) {
+            return false;
+        }
+        if (!probe_only) {
+            // Lock successful and we're not just probing, put it into the map
+            dir_locks.emplace(pathLockFile.string(), std::move(lock));
+        }
+    } catch (const boost::interprocess::interprocess_exception& e) {
+        return error("Error while attempting to lock directory %s: %s", directory.string(), e.what());
+    }
+    return true;
+}
+
+void ReleaseDirectoryLocks()
+{
+    std::lock_guard<std::mutex> ulock(cs_dir_locks);
+    dir_locks.clear();
 }
 
 /** Interpret string as boolean, for argument parsing */
@@ -602,11 +646,7 @@ void ClearDatadirCache()
 
 fs::path GetConfigFile(const std::string& confPath)
 {
-    fs::path pathConfigFile(confPath);
-    if (!pathConfigFile.is_complete())
-        pathConfigFile = GetDataDir(false) / pathConfigFile;
-
-    return pathConfigFile;
+    return AbsPathForConfigVal(fs::path(confPath), false);
 }
 
 void ArgsManager::ReadConfigFile(const std::string& confPath)
@@ -641,9 +681,7 @@ void ArgsManager::ReadConfigFile(const std::string& confPath)
 #ifndef WIN32
 fs::path GetPidFile()
 {
-    fs::path pathPidFile(gArgs.GetArg("-pid", BITCOIN_PID_FILENAME));
-    if (!pathPidFile.is_complete()) pathPidFile = GetDataDir() / pathPidFile;
-    return pathPidFile;
+    return AbsPathForConfigVal(fs::path(gArgs.GetArg("-pid", BITCOIN_PID_FILENAME)));
 }
 
 void CreatePidFile(const fs::path &path, pid_t pid)
@@ -891,11 +929,7 @@ bool SetupNetworking()
 
 int GetNumCores()
 {
-#if BOOST_VERSION >= 105600
-    return boost::thread::physical_concurrency();
-#else // Must fall back to hardware_concurrency, which unfortunately counts virtual cores
-    return boost::thread::hardware_concurrency();
-#endif
+    return std::thread::hardware_concurrency();
 }
 
 std::string CopyrightHolders(const std::string& strPrefix)
@@ -913,4 +947,9 @@ std::string CopyrightHolders(const std::string& strPrefix)
 int64_t GetStartupTime()
 {
     return nStartupTime;
+}
+
+fs::path AbsPathForConfigVal(const fs::path& path, bool net_specific)
+{
+    return fs::absolute(path, GetDataDir(net_specific));
 }

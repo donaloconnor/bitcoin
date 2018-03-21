@@ -5,6 +5,11 @@
 #ifndef BITCOIN_QT_WALLETMODEL_H
 #define BITCOIN_QT_WALLETMODEL_H
 
+#include <amount.h>
+#include <key.h>
+#include <serialize.h>
+#include <script/standard.h>
+
 #include <qt/paymentrequestplus.h>
 #include <qt/walletmodeltransaction.h>
 
@@ -14,6 +19,8 @@
 #include <vector>
 
 #include <QObject>
+
+enum class OutputType;
 
 class AddressTableModel;
 class OptionsModel;
@@ -213,6 +220,8 @@ public:
     static bool isWalletEnabled();
 
     bool hdEnabled() const;
+
+    OutputType getDefaultAddressType() const;
 
     int getDefaultConfirmTarget() const;
 

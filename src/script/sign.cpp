@@ -140,10 +140,9 @@ static CScript PushAll(const std::vector<valtype>& values)
 
 bool ProduceSignature(const BaseSignatureCreator& creator, const CScript& fromPubKey, SignatureData& sigdata)
 {
-    CScript script = fromPubKey;
     std::vector<valtype> result;
     txnouttype whichType;
-    bool solved = SignStep(creator, script, result, whichType, SIGVERSION_BASE);
+    bool solved = SignStep(creator, fromPubKey, result, whichType, SIGVERSION_BASE);
     bool P2SH = false;
     CScript subscript;
     sigdata.scriptWitness.stack.clear();
@@ -153,8 +152,8 @@ bool ProduceSignature(const BaseSignatureCreator& creator, const CScript& fromPu
         // Solver returns the subscript that needs to be evaluated;
         // the final scriptSig is the signatures from that
         // and then the serialized subscript:
-        script = subscript = CScript(result[0].begin(), result[0].end());
-        solved = solved && SignStep(creator, script, result, whichType, SIGVERSION_BASE) && whichType != TX_SCRIPTHASH;
+        subscript = CScript(result[0].begin(), result[0].end());
+        solved = solved && SignStep(creator, subscript, result, whichType, SIGVERSION_BASE) && whichType != TX_SCRIPTHASH;
         P2SH = true;
     }
 
@@ -195,11 +194,16 @@ SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nI
     return data;
 }
 
+void UpdateInput(CTxIn& input, const SignatureData& data)
+{
+    input.scriptSig = data.scriptSig;
+    input.scriptWitness = data.scriptWitness;
+}
+
 void UpdateTransaction(CMutableTransaction& tx, unsigned int nIn, const SignatureData& data)
 {
     assert(tx.vin.size() > nIn);
-    tx.vin[nIn].scriptSig = data.scriptSig;
-    tx.vin[nIn].scriptWitness = data.scriptWitness;
+    UpdateInput(tx.vin[nIn], data);
 }
 
 bool SignSignature(const CKeyStore &keystore, const CScript& fromPubKey, CMutableTransaction& txTo, unsigned int nIn, const CAmount& amount, int nHashType)
@@ -421,4 +425,23 @@ bool DummySignatureCreator::CreateSig(std::vector<unsigned char>& vchSig, const 
     vchSig[6 + 33] = 0x01;
     vchSig[6 + 33 + 32] = SIGHASH_ALL;
     return true;
+}
+
+bool IsSolvable(const CKeyStore& store, const CScript& script)
+{
+    // This check is to make sure that the script we created can actually be solved for and signed by us
+    // if we were to have the private keys. This is just to make sure that the script is valid and that,
+    // if found in a transaction, we would still accept and relay that transaction. In particular,
+    // it will reject witness outputs that require signing with an uncompressed public key.
+    DummySignatureCreator creator(&store);
+    SignatureData sigs;
+    // Make sure that STANDARD_SCRIPT_VERIFY_FLAGS includes SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, the most
+    // important property this function is designed to test for.
+    static_assert(STANDARD_SCRIPT_VERIFY_FLAGS & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, "IsSolvable requires standard script flags to include WITNESS_PUBKEYTYPE");
+    if (ProduceSignature(creator, script, sigs)) {
+        // VerifyScript check is just defensive, and should never fail.
+        assert(VerifyScript(sigs.scriptSig, script, &sigs.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, creator.Checker()));
+        return true;
+    }
+    return false;
 }
